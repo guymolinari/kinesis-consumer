@@ -16,6 +16,13 @@ import (
 	"github.com/harlow/kinesis-consumer/internal/deaggregator"
 )
 
+// Retry constants
+const ( 
+    maxRetries   = 5
+    initialDelay = 200 * time.Millisecond // Initial retry delay
+    maxDelay     = 5 * time.Second        // Maximum delay between retries
+)
+
 // Record wraps the record returned from the Kinesis library and
 // extends to include the shard id.
 type Record struct {
@@ -182,19 +189,13 @@ func (c *Consumer) ScanShard(ctx context.Context, shardID string, fn ScanFunc) e
 	defer scanTicker.Stop()
 
 	for {
-		resp, err := c.client.GetRecords(ctx, &kinesis.GetRecordsInput{
-			Limit:         aws.Int32(int32(c.maxRecords)),
-			ShardIterator: shardIterator,
-		})
-
-		// attempt to recover from GetRecords error
+		resp, err := c.fetchRecordsWithRetry(ctx, c.client, shardIterator)
 		if err != nil {
 			c.logger.Log("[CONSUMER] get records error:", err.Error())
 
 			if !isRetriableError(err) {
 				return fmt.Errorf("get records error: %v", err.Error())
 			}
-
 			shardIterator, err = c.getShardIterator(ctx, c.streamName, shardID, lastSeqNum)
 			if err != nil {
 				return fmt.Errorf("get shard iterator error: %w", err)
@@ -298,6 +299,35 @@ func (c *Consumer) getShardIterator(ctx context.Context, streamName, shardID, se
 	return res.ShardIterator, nil
 }
 
+
+func (c *Consumer) fetchRecordsWithRetry(ctx context.Context, client kinesisClient, shardIterator *string) (*kinesis.GetRecordsOutput, error) {
+	var retries int
+	delay := initialDelay
+
+	for {
+		output, err := client.GetRecords(ctx, &kinesis.GetRecordsInput{
+			//ShardIterator: aws.String(shardIterator),
+			ShardIterator: shardIterator,
+			Limit:         aws.Int32(int32(c.maxRecords)),
+		})
+
+		if err == nil {
+			return output, nil
+		}
+
+		// Check if the error is retriable
+		if !isRetriableError(err) || retries >= maxRetries {
+			return nil, fmt.Errorf("max retries reached or unrecoverable error: %w", err)
+		}
+
+		// Log and retry
+		retries++
+		c.logger.Log(fmt.Sprintf("Retry %d/%d: %v", retries, maxRetries, err))
+		time.Sleep(delay)
+		delay = nextRetryDelay(delay)
+	}
+}
+
 func isRetriableError(err error) bool {
 	if oe := (*types.ExpiredIteratorException)(nil); errors.As(err, &oe) {
 		return true
@@ -305,7 +335,19 @@ func isRetriableError(err error) bool {
 	if oe := (*types.ProvisionedThroughputExceededException)(nil); errors.As(err, &oe) {
 		return true
 	}
+	//if oe := (*types.ThrottlingException)(nil); errors.As(err, &oe) {
+	//	return true
+	//}
 	return false
+}
+
+func nextRetryDelay(currentDelay time.Duration) time.Duration {
+	// Exponential backoff with a cap
+	nextDelay := currentDelay * 2
+	if nextDelay > maxDelay {
+		return maxDelay
+	}
+	return nextDelay
 }
 
 func isShardClosed(nextShardIterator, currentShardIterator *string) bool {
